@@ -7,12 +7,12 @@ library(coda)
 library(zip)
 library(terra)
 
-# Jessie note: this is the "stable" version referred to in the readme
+# Jessie note: this is the "beta" version referred to in the readme
 
 mcmc_data <- load("IWJV/data/test_model.R")
-species_data <- read.csv("IWJV/data/spp_list_04sep2024.csv")
 
 server <- function(input, output, session) {
+  
   # Load MCMC data
   mcmc_data <- reactive({
     print("Loading MCMC data...")
@@ -21,7 +21,7 @@ server <- function(input, output, session) {
     return(mcmc.lst)
   })
   
-  # Load raster data
+  # Load raster data                              ## Jessie note: same as stable
   rasters <- reactive({
     print("Loading raster data...")
     raster_list <- list(
@@ -39,33 +39,47 @@ server <- function(input, output, session) {
   })
   
   # Function to adjust rasters based on user input
-  adjustRasters <- reactive({
+  adjustRasters <- reactive({            ## Jessie note: updated compared to stable. Removed withProgress updater, variable names changed for output.
     req(input$runModel)
     print("Adjusting rasters based on user input...")
     
-    withProgress(message = 'Adjusting rasters', value = 0, {
-      original <- rasters()
-      adjusted <- list()
-      
-      total_rasters <- length(original)
-      for (i in seq_along(original)) {
-        name <- names(original)[i]
-        if (name %in% c("tree_canopy_cover", "qmd_rmrs", "tpa_dead", "tpa_live")) {
-          adjustment <- input[[name]] / 100 + 1
-          adjusted[[name]] <- original[[name]] * adjustment
-          print(paste("Adjusted", name, "by factor of", adjustment))
-        } else {
-          adjusted[[name]] <- original[[name]]
-        }
-        incProgress(1/total_rasters, detail = paste("Adjusting", name))
+    original <- rasters()
+    adjusted <- list()
+    
+    for (name in names(original)) {
+      if (name %in% c("tree_canopy_cover", "qmd_rmrs", "tpa_dead", "tpa_live")) {
+        adjustment <- input[[name]] / 100 + 1
+        adjusted[[name]] <- original[[name]] * adjustment
+        print(paste("Adjusted", name, "by factor of", adjustment))
+      } else {
+        adjusted[[name]] <- original[[name]]
       }
-      
-      print("Raster adjustment complete.")
-      return(list(original = original, adjusted = adjusted))
-    })
+    }
+    
+    print("Raster adjustment complete.")
+    return(list(original = original, adjusted = adjusted))
   })
   
+  # Create the 1 km² grid polygons (1000m x 1000m)
+  createGrid <- function(management_area) {   ## Jessie note: updated to pull this function out separately from generateing the processShapefile reactive object
+    # Generate grid polygons (1km x 1km)
+    grid <- st_make_grid(management_area, cellsize = 1000, what = "polygons")
+    
+    # Convert to sf object
+    grid <- st_sf(geometry = grid)
+    
+    # Get the CRS of the rasters (assuming all rasters have the same CRS)
+    raster_crs <- crs(rasters()$tree_canopy_cover)
+    
+    # Reproject the grid to match the raster CRS
+    grid <- st_transform(grid, raster_crs)
+    
+    print(paste("1 km² grid created with", nrow(grid), "polygons."))
+    return(grid)
+  }
+  
   # Process uploaded shapefile
+  # Create the grid and calculate covariates for each grid cell
   processShapefile <- reactive({
     req(input$shapefile)
     print("Processing uploaded shapefile...")
@@ -83,103 +97,93 @@ server <- function(input, output, session) {
       management_area <- st_read(shp_file)
       print("Shapefile read successfully.")
       
-      # Get the CRS of the first raster (assuming all rasters have the same CRS)
-      raster_crs <- crs(rasters()$tree_canopy_cover)
+      # Create the 1km² grid using the management area
+      grid <- createGrid(management_area)
       
-      # Reproject the management area to match raster CRS
-      management_area <- st_transform(management_area, raster_crs)
-      print(paste("Management area reprojected to:", raster_crs))
-      
-      print("Creating 1km2 grid...")
-      bbox <- st_bbox(management_area)
-      grid <- st_make_grid(management_area, cellsize = 1000, what = "centers")
-      grid <- st_sf(geometry = grid)
-      
-      intersected_grid <- st_intersection(grid, management_area)
-      print(paste("Grid created with", nrow(intersected_grid), "cells."))
-      
-      return(intersected_grid)
+      return(grid)
     }, error = function(e) {
       print(paste("Error processing shapefile:", e$message))
       return(NULL)
     })
   })
   
-  # Generate covariates for grid cells
-  #-----------------------------------------------------------------------------
   generateGridCovariates <- reactive({
     req(processShapefile())
     req(adjustRasters())
     
     print("Generating covariates for grid cells...")
+    
+    # Get the grid of polygons
     grid <- processShapefile()
-    if (is.null(grid)) {
-      print("Error: Grid is NULL. Cannot generate covariates.")
-      return(NULL)
+    
+    # Get the CRS of the grid (assuming it comes from your management area shapefile)
+    grid_crs <- st_crs(grid)$proj4string
+    
+    # Adjust and reproject rasters if necessary
+    reprojectRaster <- function(raster, grid_crs) {
+      # Get the CRS of the raster
+      raster_crs <- terra::crs(raster)
+      if (raster_crs != grid_crs) {
+        # Reproject raster to match the grid's CRS
+        raster <- terra::project(raster, grid_crs)
+        print(paste("Reprojected raster to match grid CRS:", grid_crs))
+      }
+      return(raster)
     }
     
+    # Reproject all rasters to match the grid CRS
     raster_data <- adjustRasters()
+    raster_data$adjusted <- lapply(raster_data$adjusted, reprojectRaster, grid_crs)
     
-    calculateCovariates <- function(point, rasters) {
-      values <- lapply(rasters$adjusted, function(r) {
-        extracted <- terra::extract(r, matrix(point, ncol = 2))
-        print(paste("Extracted value for", names(r), ":", extracted))
-        if (is.data.frame(extracted) && ncol(extracted) > 0) {
-          return(as.numeric(extracted[1,1]))
-        } else {
-          return(NA)
-        }
-      })
+    # For each raster, calculate the mean, CV, and other statistics for each polygon
+    calculateCovariates <- function(r, grid) {
+      if (is.null(r)) {
+        stop("Raster is NULL. Please check if the raster was loaded correctly.")
+      }
       
-      covariates <- list(
-        canopy_gap_percent = mean(values$tree_canopy_cover < 10, na.rm = TRUE) * 100,
-        open_forest_percent = mean(values$tree_canopy_cover >= 10 & values$tree_canopy_cover < 40, na.rm = TRUE) * 100,
-        higher_severity_percent = mean(values$burn_severity >= 4, na.rm = TRUE) * 100,
-        lower_severity_percent = mean(values$burn_severity >= 2 & values$burn_severity < 4, na.rm = TRUE) * 100,
-        mean_years_since_wildfire = mean(values$years_since_wildfire, na.rm = TRUE),
-        veg_departure_mean = mean(values$veg_departure, na.rm = TRUE),
-        qmd_rmrs_mean = mean(values$qmd_rmrs, na.rm = TRUE),
-        qmd_rmrs_cv = ifelse(mean(values$qmd_rmrs, na.rm = TRUE) > 0,
-                             sd(values$qmd_rmrs, na.rm = TRUE) / mean(values$qmd_rmrs, na.rm = TRUE),
-                             0),
-        tpa_dead_mean = mean(values$tpa_dead, na.rm = TRUE),
-        tpa_live_cv = ifelse(mean(values$tpa_live, na.rm = TRUE) > 0,
-                             sd(values$tpa_live, na.rm = TRUE) / mean(values$tpa_live, na.rm = TRUE),
-                             0)
-      )
+      # Extract raster values for the grid polygons and compute statistics (e.g., mean)
+      mean_values <- terra::extract(r, grid, fun = mean, na.rm = TRUE, df = TRUE)
+      sd_values <- terra::extract(r, grid, fun = sd, na.rm = TRUE, df = TRUE)
       
-      # Convert any remaining NAs to 0
-      covariates <- lapply(covariates, function(x) ifelse(is.na(x), 0, x))
+      # Calculate CV (coefficient of variation) if mean > 0
+      cv_values <- ifelse(mean_values[,2] > 0, (sd_values[,2] / mean_values[,2]), 0)
       
-      return(unlist(covariates))
-    }
-    # end calculateCovariates function
-    
-    print("Calculating covariates for each grid cell...")
-    grid_points <- st_coordinates(grid) # Jessie note: grid == the gridded shapefile uploaded by user
-    grid_covariates <- apply(grid_points, 1, calculateCovariates, rasters = raster_data) # Jessie note: in apply, 1 indicates to apply the func to the rows
-    
-    if (!is.numeric(grid_covariates)) {
-      print("Error: Covariate calculation did not produce numeric results.")
-      print("Structure of grid_covariates:")
-      print(str(grid_covariates))
-      return(NULL)
+      # Return a data frame of statistics
+      return(data.frame(
+        mean = mean_values[,2],
+        cv = cv_values
+      ))
     }
     
-    grid_covariates_df <- as.data.frame(t(grid_covariates))
+    # Apply covariate calculation for each raster
+    tree_canopy_covariates <- calculateCovariates(raster_data$adjusted$tree_canopy_cover, grid)
+    qmd_rmrs_covariates <- calculateCovariates(raster_data$adjusted$qmd_rmrs, grid)
+    tpa_dead_covariates <- calculateCovariates(raster_data$adjusted$tpa_dead, grid)
+    tpa_live_covariates <- calculateCovariates(raster_data$adjusted$tpa_live, grid)
+    burn_severity_covariates <- calculateCovariates(raster_data$adjusted$burn_severity, grid)
+    veg_departure_covariates <- calculateCovariates(raster_data$adjusted$veg_departure, grid)
+    years_since_wildfire_covariates <- calculateCovariates(raster_data$adjusted$years_since_wildfire, grid)
     
+    # Combine the covariates into a final data frame
+    grid_covariates_df <- data.frame(
+      canopy_mean = tree_canopy_covariates$mean,
+      canopy_cv = tree_canopy_covariates$cv,
+      qmd_rmrs_mean = qmd_rmrs_covariates$mean,
+      qmd_rmrs_cv = qmd_rmrs_covariates$cv,
+      tpa_dead_mean = tpa_dead_covariates$mean,
+      tpa_live_cv = tpa_live_covariates$cv,
+      burn_severity_mean = burn_severity_covariates$mean,
+      veg_departure_mean = veg_departure_covariates$mean,
+      mean_years_since_wildfire = years_since_wildfire_covariates$mean
+    )
+    
+    # Combine the grid geometry with covariates
     result <- cbind(grid, grid_covariates_df)
     
     print("Covariate generation complete.")
-    print("Covariates for each grid cell:")
-    print(grid_covariates_df)
-    print(paste("Number of grid cells with covariates:", nrow(result)))
     return(result)
   })
-  #---------------end generate covariates for grid cells------------------------
   
-  # Predict abundance
-  #-----------------------------------------------------------------------------
   predictAbundance <- reactive({
     req(input$species)
     req(generateGridCovariates())
@@ -199,9 +203,6 @@ server <- function(input, output, session) {
     
     species_index <- as.numeric(sub("Species ", "", input$species))
     print(paste("Predicting for Species", species_index))
-    
-    # Get the conversion factor for the selected species
-    N2D <- species_data$N2D[species_index]
     
     # Extract species-specific coefficients
     int_psi <- mean(as.matrix(mcmc[[1]])[, paste0("int.psi[", species_index, "]")])
@@ -324,10 +325,10 @@ server <- function(input, output, session) {
         
         print(paste("Calculated Lambda:", lambda))
         
-        # Calculate abundance and convert to individuals/sq. km
-        abundance <- psi * lambda * N2D
+        # Calculate abundance
+        abundance <- psi * lambda
         
-        print(paste("Calculated Abundance (individuals/sq. km):", abundance))
+        print(paste("Calculated Abundance:", abundance))
         
         return(c(psi = psi, lambda = lambda, abundance = abundance))
       }, error = function(e) {
@@ -357,16 +358,15 @@ server <- function(input, output, session) {
     }
     
     print("Abundance prediction complete.")
-    print(paste("Mean predicted abundance (individuals/sq. km):", mean(grid_covariates$abundance, na.rm = TRUE)))
+    print(paste("Mean predicted abundance:", mean(grid_covariates$abundance, na.rm = TRUE)))
     
     # Make lambda_covariates available for the importance plot
     grid_covariates$lambda_covariates <- list(lambda_covariates)
     
     return(grid_covariates)
   })
-  #---------------------end predict abundance-----------------------------------
   
-  # Create abundance raster function
+  # Update the create_abundance_raster function with error checking
   create_abundance_raster <- function(abundance_data) {
     tryCatch({
       # Ensure abundance_data is an sf object
@@ -400,7 +400,7 @@ server <- function(input, output, session) {
     })
   }
   
-  # Render abundance map
+  # Update the renderLeaflet function
   output$abundanceMap <- renderLeaflet({
     req(predictAbundance())
     print("Rendering abundance map...")
@@ -422,17 +422,14 @@ server <- function(input, output, session) {
     # Create a color palette
     pal <- colorNumeric(c("yellow", "red"), values(abundance_raster), na.color = "transparent")
     
-    # Get the species name
-    species_name <- species_data$common.name[as.numeric(sub("Species ", "", input$species))]
-    
     # Create the leaflet map
     leaflet() %>%
       addTiles() %>%
       addRasterImage(abundance_raster, colors = pal, opacity = 0.7) %>%
-      addLegend(pal = pal, values = values(abundance_raster), title = paste(species_name, "<br>(individuals/sq. km)"))
+      addLegend(pal = pal, values = values(abundance_raster), title = "Abundance")
   })
   
-  # Render covariate importance plot
+  # Update the covariate importance plot
   output$covariateImportance <- renderPlot({
     req(predictAbundance())
     req(mcmc_data())
@@ -448,16 +445,15 @@ server <- function(input, output, session) {
     names(importance) <- abundance_data$lambda_covariates[[1]]  # Use the lambda_covariates from the abundance data
     
     par(mar = c(10, 4, 4, 2) + 0.1)  # Increase bottom margin for long labels
-    barplot(sort(importance, decreasing = TRUE),
-            main = "Covariate Importance",
-            las = 2,
+    barplot(sort(importance, decreasing = TRUE), 
+            main = "Covariate Importance", 
+            las = 2, 
             cex.names = 0.7,  # Reduce text size if needed
             ylab = "Absolute coefficient value")
     
     print("Covariate importance plot generated.")
   })
   
-  # Update the abundance statistics table
   output$abundanceStats <- renderTable({
     req(predictAbundance())
     print("Calculating abundance statistics...")
@@ -468,176 +464,32 @@ server <- function(input, output, session) {
       return(NULL)
     }
     
-    # Calculate the sum of abundances across all grid cells
-    total_abundance <- sum(abundance_data$abundance, na.rm = TRUE)
-    
     stats <- data.frame(
-      Statistic = c("Total Abundance", "Mean Abundance per Cell", "Number of Cells"),
+      Statistic = c("Mean", "Median", "Min", "Max", "Standard Deviation"),
       Value = c(
-        total_abundance,
         mean(abundance_data$abundance, na.rm = TRUE),
-        nrow(abundance_data)
+        median(abundance_data$abundance, na.rm = TRUE),
+        min(abundance_data$abundance, na.rm = TRUE),
+        max(abundance_data$abundance, na.rm = TRUE),
+        sd(abundance_data$abundance, na.rm = TRUE)
       )
     )
     
-    stats$Value <- round(stats$Value, 2)  # Round to 2 decimal places for readability
+    stats$Value <- round(stats$Value, 6)  # Round to 6 decimal places for readability
     
     print("Abundance statistics calculated.")
     return(stats)
   })
   
-  # Modify the calculateAllSpeciesAbundance function to prevent looping
-  calculateAllSpeciesAbundance <- reactive({
-    req(input$runModel)
-    print("Calculating abundance for all species...")
-    
-    # Store the current species selection
-    current_species <- input$species
-    
-    all_species_data <- lapply(1:nrow(species_data), function(i) {
-      species_name <- paste("Species", i)
-      withProgress(message = 'Calculating abundances', value = 0, {
-        incProgress(1/nrow(species_data), detail = paste("Species", i))
-        
-        # Set the species without triggering reactivity
-        isolate({
-          updateSelectInput(session, "species", selected = species_name)
-        })
-        
-        # Calculate abundance for this species
-        abundance_data <- predictAbundance()
-        
-        if (!is.null(abundance_data)) {
-          total_abundance <- sum(abundance_data$abundance, na.rm = TRUE)
-          return(total_abundance)
-        } else {
-          return(NA)
-        }
-      })
-    })
-    
-    # Reset the species selection to the original value
-    updateSelectInput(session, "species", selected = current_species)
-    
-    # Create a data frame with the results
-    result <- data.frame(
-      Species = species_data$common.name,
-      TotalAbundance = unlist(all_species_data)
-    )
-    
-    print("All species abundance calculation complete.")
-    return(result)
-  })
-  
-  # Update the speciesAbundancePlot to use the calculated data
-  output$speciesAbundancePlot <- renderPlot({
-    req(input$runModel)
-    print("Generating species abundance plot...")
-    
-    all_species_data <- calculateAllSpeciesAbundance()
-    
-    ggplot(all_species_data, aes(x = reorder(Species, TotalAbundance), y = TotalAbundance)) +
-      geom_bar(stat = "identity") +
-      coord_flip() +
-      labs(title = "Total Abundance Estimates for All Species",
-           x = "Species",
-           y = "Total Abundance (individuals)") +
-      theme_minimal() +
-      theme(axis.text.y = element_text(size = 8))
-  })
-  
   # Download handler for abundance data
   output$downloadAbundance <- downloadHandler(
     filename = function() {
-      paste("abundance_data_", species_data$common.name[as.numeric(sub("Species ", "", input$species))], ".csv", sep = "")
+      paste("abundance_data_species_", input$species, ".csv", sep = "")
     },
     content = function(file) {
       abundance_data <- predictAbundance()
       if (!is.null(abundance_data)) {
         write.csv(abundance_data, file, row.names = FALSE)
-      }
-    }
-  )
-  
-  # Download handler for the abundance map
-  output$downloadMap <- downloadHandler(
-    filename = function() {
-      paste("abundance_map_", species_data$common.name[as.numeric(sub("Species ", "", input$species))], ".png", sep = "")
-    },
-    content = function(file) {
-      req(predictAbundance())
-      abundance_data <- predictAbundance()
-      
-      if (!is.null(abundance_data)) {
-        abundance_raster <- create_abundance_raster(abundance_data)
-        
-        if (!is.null(abundance_raster)) {
-          png(file, width = 800, height = 600)
-          plot(abundance_raster, main = paste("Abundance Map for", species_data$common.name[as.numeric(sub("Species ", "", input$species))]))
-          dev.off()
-        } else {
-          stop("Failed to create abundance raster for download.")
-        }
-      } else {
-        stop("No abundance data available for download.")
-      }
-    }
-  )
-  
-  # Download handler for abundance statistics
-  output$downloadStats <- downloadHandler(
-    filename = function() {
-      paste("abundance_stats_", species_data$common.name[as.numeric(sub("Species ", "", input$species))], ".csv", sep = "")
-    },
-    content = function(file) {
-      req(predictAbundance())
-      abundance_data <- predictAbundance()
-      
-      if (!is.null(abundance_data)) {
-        stats <- data.frame(
-          Statistic = c("Mean", "Median", "Min", "Max", "Standard Deviation"),
-          Value = c(
-            mean(abundance_data$abundance, na.rm = TRUE),
-            median(abundance_data$abundance, na.rm = TRUE),
-            min(abundance_data$abundance, na.rm = TRUE),
-            max(abundance_data$abundance, na.rm = TRUE),
-            sd(abundance_data$abundance, na.rm = TRUE)
-          )
-        )
-        stats$Value <- round(stats$Value, 6)
-        write.csv(stats, file, row.names = FALSE)
-      } else {
-        stop("No abundance statistics available for download.")
-      }
-    }
-  )
-  
-  # Download handler for covariate importance plot
-  output$downloadPlot <- downloadHandler(
-    filename = function() {
-      paste("covariate_importance_", species_data$common.name[as.numeric(sub("Species ", "", input$species))], ".png", sep = "")
-    },
-    content = function(file) {
-      req(predictAbundance(), mcmc_data())
-      abundance_data <- predictAbundance()
-      mcmc <- mcmc_data()
-      species_index <- as.numeric(sub("Species ", "", input$species))
-      
-      if (!is.null(abundance_data) && !is.null(mcmc)) {
-        beta_lambda <- colMeans(as.matrix(mcmc[[1]])[, grep(paste0("beta.lambda\\[", species_index, ","), colnames(as.matrix(mcmc[[1]])))])
-        importance <- abs(beta_lambda)
-        names(importance) <- abundance_data$lambda_covariates[[1]]
-        
-        png(file, width = 800, height = 600)
-        par(mar = c(10, 4, 4, 2) + 0.1)
-        barplot(sort(importance, decreasing = TRUE),
-                main = paste("Covariate Importance for", species_data$common.name[species_index]),
-                las = 2,
-                cex.names = 0.7,
-                ylab = "Absolute coefficient value")
-        dev.off()
-      } else {
-        stop("No covariate importance data available for download.")
       }
     }
   )
